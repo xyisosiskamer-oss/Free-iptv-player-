@@ -1,0 +1,6 @@
+{
+  "name": "Kobaidze IPTV",
+  "description": "Kobaidze IPTV M3U & EPG player for phone and Android TV with preloaded playlists, favorites, search, and Russian/Georgian interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
