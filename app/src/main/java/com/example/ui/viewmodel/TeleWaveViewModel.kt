@@ -9,6 +9,8 @@ import com.example.data.local.TeleWaveDatabase
 import com.example.data.model.ChannelItem
 import com.example.data.model.EpgProgramUi
 import com.example.data.parser.CatchupUrlBuilder
+import com.example.data.parser.PlaylistImportValidator
+import com.example.data.parser.PlaylistValidationResult
 import com.example.data.preferences.ChannelViewMode
 import com.example.data.preferences.PlayerResizeMode
 import com.example.data.preferences.UserPreferencesRepository
@@ -43,6 +45,31 @@ data class PlayerSession(
     val archivePlayback: ArchivePlayback? = null
 )
 
+sealed interface PendingExternalImport {
+    val suggestedName: String
+    val sourceLabel: String
+    val possibleDuplicateId: Long?
+    val possibleDuplicateName: String?
+
+    data class LocalContent(
+        override val suggestedName: String,
+        override val sourceLabel: String,
+        val rawContent: String,
+        val channelCount: Int,
+        val detectedEpgUrl: String?,
+        override val possibleDuplicateId: Long?,
+        override val possibleDuplicateName: String?
+    ) : PendingExternalImport
+
+    data class RemoteUrl(
+        override val suggestedName: String,
+        override val sourceLabel: String,
+        val url: String,
+        override val possibleDuplicateId: Long?,
+        override val possibleDuplicateName: String?
+    ) : PendingExternalImport
+}
+
 data class TeleWaveUiState(
     val language: AppLanguage = AppLanguage.RUSSIAN,
     val currentTab: AppTab = AppTab.CHANNELS,
@@ -65,7 +92,8 @@ data class TeleWaveUiState(
     val recentChannels: List<ChannelItem> = emptyList(),
     val isSyncing: Boolean = false,
     val syncingPlaylistIds: Set<Long> = emptySet(),
-    val playerSession: PlayerSession? = null
+    val playerSession: PlayerSession? = null,
+    val pendingExternalImport: PendingExternalImport? = null
 )
 
 class TeleWaveViewModel(application: Application) : AndroidViewModel(application) {
@@ -82,6 +110,7 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
     private val isSyncingEpgFlow = MutableStateFlow(false)
     private val syncingPlaylistIdsFlow = MutableStateFlow<Set<Long>>(emptySet())
     private val playerSessionFlow = MutableStateFlow<PlayerSession?>(null)
+    private val pendingExternalImportFlow = MutableStateFlow<PendingExternalImport?>(null)
 
     private val _snackbarEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val snackbarEvents = _snackbarEvents.asSharedFlow()
@@ -129,8 +158,9 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
         baseDataFlow,
         epgMetaFlow,
         channelsDataFlow,
-        uiControlsFlow
-    ) { base, epgMeta, chData, controls ->
+        uiControlsFlow,
+        pendingExternalImportFlow
+    ) { base, epgMeta, chData, controls, pendingImport ->
         val validActivePlaylistId = base.activePlaylistId?.takeIf { id ->
             base.playlists.any { it.id == id && it.isEnabled }
         }
@@ -227,7 +257,8 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
             recentChannels = recentItems,
             isSyncing = controls.isSyncing,
             syncingPlaylistIds = controls.syncingIds,
-            playerSession = syncedSession
+            playerSession = syncedSession,
+            pendingExternalImport = pendingImport
         )
     }.stateIn(
         scope = viewModelScope,
@@ -543,6 +574,153 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
                     _snackbarEvents.tryEmit(strings.playlistLoadError(err.message ?: "Error"))
                 }
             isSyncingFlow.value = false
+        }
+    }
+
+    fun clearRecentChannels() {
+        viewModelScope.launch {
+            repository.clearRecentChannels()
+        }
+    }
+
+    fun handleIncomingUri(uri: Uri, displayName: String?) {
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        if (scheme == "http" || scheme == "https") {
+            handleIncomingText(uri.toString())
+            return
+        }
+        viewModelScope.launch {
+            val strings = stringsFor(uiState.value.language)
+            val rawResult = repository.readTextFromUri(uri)
+            rawResult.onSuccess { text ->
+                val cleanName = displayName?.takeIf { it.isNotBlank() } ?: "playlist.m3u"
+                when (val validation = PlaylistImportValidator.validateM3uContent(text)) {
+                    is PlaylistValidationResult.Valid -> {
+                        val suggested = PlaylistImportValidator.suggestNameFromDisplayName(cleanName)
+                        val sourceLabel = "file://$cleanName"
+                        val dup = uiState.value.playlists.firstOrNull {
+                            it.url == sourceLabel ||
+                                (it.name.equals(suggested, ignoreCase = true) &&
+                                    it.channelCount == validation.parseResult.channels.size)
+                        }
+                        pendingExternalImportFlow.value = PendingExternalImport.LocalContent(
+                            suggestedName = suggested,
+                            sourceLabel = cleanName,
+                            rawContent = text,
+                            channelCount = validation.parseResult.channels.size,
+                            detectedEpgUrl = validation.parseResult.epgUrl,
+                            possibleDuplicateId = dup?.id,
+                            possibleDuplicateName = dup?.name
+                        )
+                    }
+                    is PlaylistValidationResult.Invalid -> {
+                        _snackbarEvents.tryEmit(strings.playlistLoadError(validation.reason))
+                    }
+                }
+            }.onFailure { err ->
+                _snackbarEvents.tryEmit(strings.playlistLoadError(err.message ?: "Error"))
+            }
+        }
+    }
+
+    fun handleIncomingText(rawText: String) {
+        val strings = stringsFor(uiState.value.language)
+        val url = PlaylistImportValidator.extractFirstHttpUrl(rawText)
+        if (url != null) {
+            val dup = uiState.value.playlists.firstOrNull { it.url == url }
+            val suggested = PlaylistImportValidator.suggestNameFromDisplayName(url, fallback = "IPTV Playlist")
+            pendingExternalImportFlow.value = PendingExternalImport.RemoteUrl(
+                suggestedName = suggested,
+                sourceLabel = url,
+                url = url,
+                possibleDuplicateId = dup?.id,
+                possibleDuplicateName = dup?.name
+            )
+            return
+        }
+        if (rawText.contains("#EXTINF", ignoreCase = true)) {
+            when (val validation = PlaylistImportValidator.validateM3uContent(rawText)) {
+                is PlaylistValidationResult.Valid -> {
+                    pendingExternalImportFlow.value = PendingExternalImport.LocalContent(
+                        suggestedName = "Shared M3U",
+                        sourceLabel = "Shared text",
+                        rawContent = rawText,
+                        channelCount = validation.parseResult.channels.size,
+                        detectedEpgUrl = validation.parseResult.epgUrl,
+                        possibleDuplicateId = null,
+                        possibleDuplicateName = null
+                    )
+                }
+                is PlaylistValidationResult.Invalid -> {
+                    _snackbarEvents.tryEmit(strings.playlistLoadError(validation.reason))
+                }
+            }
+        } else {
+            _snackbarEvents.tryEmit(strings.invalidPlaylistInput)
+        }
+    }
+
+    fun dismissIncomingImport() {
+        pendingExternalImportFlow.value = null
+    }
+
+    fun confirmIncomingAsNew(customName: String) {
+        val pending = pendingExternalImportFlow.value ?: return
+        pendingExternalImportFlow.value = null
+        viewModelScope.launch {
+            isSyncingFlow.value = true
+            val strings = stringsFor(uiState.value.language)
+            val result = when (pending) {
+                is PendingExternalImport.LocalContent -> repository.addPlaylistFromLocalContent(
+                    name = customName,
+                    sourceLabel = "file://${pending.sourceLabel}",
+                    rawContent = pending.rawContent,
+                    manualEpgUrl = pending.detectedEpgUrl
+                )
+                is PendingExternalImport.RemoteUrl -> repository.addPlaylistFromUrl(
+                    name = customName,
+                    url = pending.url
+                )
+            }
+            isSyncingFlow.value = false
+            result.onSuccess { (newId, count) ->
+                prefs.setActivePlaylistId(newId)
+                currentTabFlow.value = AppTab.CHANNELS
+                _snackbarEvents.tryEmit(strings.playlistRefreshedMsg(customName, count))
+            }.onFailure { err ->
+                _snackbarEvents.tryEmit(strings.playlistLoadError(err.message ?: "Error"))
+            }
+        }
+    }
+
+    fun confirmIncomingReplace(targetId: Long, customName: String) {
+        val pending = pendingExternalImportFlow.value ?: return
+        pendingExternalImportFlow.value = null
+        viewModelScope.launch {
+            isSyncingFlow.value = true
+            val strings = stringsFor(uiState.value.language)
+            val result = when (pending) {
+                is PendingExternalImport.LocalContent -> repository.replacePlaylistWithLocalContent(
+                    targetPlaylistId = targetId,
+                    newName = customName,
+                    sourceLabel = "file://${pending.sourceLabel}",
+                    rawContent = pending.rawContent,
+                    manualEpgUrl = pending.detectedEpgUrl
+                )
+                is PendingExternalImport.RemoteUrl -> repository.replacePlaylistWithUrl(
+                    targetPlaylistId = targetId,
+                    newName = customName,
+                    newUrl = pending.url
+                )
+            }
+            isSyncingFlow.value = false
+            result.onSuccess { (updatedId, count) ->
+                prefs.setActivePlaylistId(updatedId)
+                currentTabFlow.value = AppTab.CHANNELS
+                _snackbarEvents.tryEmit(strings.playlistRefreshedMsg(customName, count))
+            }.onFailure { err ->
+                _snackbarEvents.tryEmit(strings.playlistLoadError(err.message ?: "Error"))
+            }
         }
     }
 

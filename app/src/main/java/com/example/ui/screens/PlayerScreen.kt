@@ -4,9 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.media.AudioManager
 import android.view.KeyEvent
-import android.view.OrientationEventListener
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
@@ -19,7 +20,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -45,7 +47,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.BrightnessHigh
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -54,6 +59,8 @@ import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -61,6 +68,7 @@ import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -84,6 +92,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -97,10 +106,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
@@ -150,9 +162,16 @@ private sealed interface PlayerErrorState {
 }
 
 private enum class PlayerOrientationLock {
-    AUTO_SENSOR,
+    SYSTEM_DEFAULT,
     LOCKED_LANDSCAPE,
     LOCKED_PORTRAIT
+}
+
+private sealed interface PlayerHudFeedback {
+    data class SeekDelta(val seconds: Int) : PlayerHudFeedback
+    data class Brightness(val percent: Int) : PlayerHudFeedback
+    data class Volume(val percent: Int) : PlayerHudFeedback
+    data class Message(val text: String) : PlayerHudFeedback
 }
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
@@ -184,9 +203,11 @@ fun PlayerScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val activity = remember(context) { context.findActivity() }
 
-    var orientationLock by remember { mutableStateOf(PlayerOrientationLock.AUTO_SENSOR) }
+    var orientationLock by remember { mutableStateOf(PlayerOrientationLock.SYSTEM_DEFAULT) }
     var showControls by remember { mutableStateOf(true) }
     var showDrawer by remember { mutableStateOf(false) }
+    var isScreenLocked by remember { mutableStateOf(false) }
+    var showUnlockPill by remember { mutableStateOf(false) }
     var isBuffering by remember { mutableStateOf(true) }
     var isPlaying by remember { mutableStateOf(true) }
     var playbackError by remember { mutableStateOf<PlayerErrorState?>(null) }
@@ -200,6 +221,27 @@ fun PlayerScreen(
     var isLiveStream by remember { mutableStateOf(false) }
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubPositionMs by remember { mutableLongStateOf(0L) }
+    var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+
+    var showSleepTimerDialog by remember { mutableStateOf(false) }
+    var sleepTimerEndAtMs by remember { mutableLongStateOf(0L) }
+    var sleepTimerMinutesLeft by remember { mutableIntStateOf(0) }
+
+    var hudFeedback by remember { mutableStateOf<PlayerHudFeedback?>(null) }
+    var hudFeedbackToken by remember { mutableIntStateOf(0) }
+    var videoBoxSize by remember { mutableStateOf(IntSize.Zero) }
+
+    val audioManager = remember(context) {
+        context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
+    val initialBrightness = remember(activity) {
+        activity?.window?.attributes?.screenBrightness ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+    }
+    var sessionBrightness by remember {
+        mutableFloatStateOf(
+            if (initialBrightness in 0f..1f) initialBrightness else 0.6f
+        )
+    }
 
     val activeArchive = session.archivePlayback
     val playbackUrl = activeArchive?.archiveUrl ?: session.currentChannel.streamUrl
@@ -217,49 +259,24 @@ fun PlayerScreen(
     LaunchedEffect(orientationLock, isTv, activity) {
         if (!isTv && activity != null) {
             activity.requestedOrientation = when (orientationLock) {
-                PlayerOrientationLock.AUTO_SENSOR -> ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                PlayerOrientationLock.SYSTEM_DEFAULT -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 PlayerOrientationLock.LOCKED_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 PlayerOrientationLock.LOCKED_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             }
         }
     }
 
-    DisposableEffect(isTv, context, activity) {
-        val orientationListener = if (!isTv) {
-            object : OrientationEventListener(context.applicationContext) {
-                override fun onOrientationChanged(orientation: Int) {
-                    if (orientation == ORIENTATION_UNKNOWN) return
-                    val isUpright = orientation <= 25 || orientation >= 335
-                    val isSideways = orientation in 65..115 || orientation in 245..295
-                    when (orientationLock) {
-                        PlayerOrientationLock.LOCKED_PORTRAIT -> {
-                            if (isUpright) {
-                                orientationLock = PlayerOrientationLock.AUTO_SENSOR
-                            }
-                        }
-                        PlayerOrientationLock.LOCKED_LANDSCAPE -> {
-                            if (isSideways) {
-                                orientationLock = PlayerOrientationLock.AUTO_SENSOR
-                            }
-                        }
-                        PlayerOrientationLock.AUTO_SENSOR -> Unit
-                    }
-                }
-            }.apply {
-                if (canDetectOrientation()) {
-                    enable()
-                }
-            }
-        } else {
-            null
-        }
-
+    DisposableEffect(isTv, activity) {
         onDispose {
-            orientationListener?.disable()
             val w = activity?.window
             if (w != null) {
                 WindowCompat.getInsetsController(w, w.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
+                val lp = w.attributes
+                if (lp.screenBrightness != initialBrightness) {
+                    lp.screenBrightness = initialBrightness
+                    w.attributes = lp
+                }
             }
             if (!isTv) {
                 activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -343,9 +360,20 @@ fun PlayerScreen(
             .createMediaSource(MediaItem.fromUri(playbackUrl))
 
         exoPlayer.setMediaSource(mediaSource)
+        exoPlayer.setPlaybackSpeed(playbackSpeed)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         showControls = true
+    }
+
+    LaunchedEffect(playbackSpeed) {
+        exoPlayer.setPlaybackSpeed(playbackSpeed)
+    }
+
+    LaunchedEffect(activeArchive) {
+        if (activeArchive == null && playbackSpeed != 1.0f) {
+            playbackSpeed = 1.0f
+        }
     }
 
     LaunchedEffect(exoPlayer, playbackUrl) {
@@ -362,10 +390,44 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(showControls, isPlaying, showDrawer, playbackError, isScrubbing) {
-        if (showControls && isPlaying && !showDrawer && playbackError == null && !isScrubbing) {
+    LaunchedEffect(showControls, isPlaying, showDrawer, playbackError, isScrubbing, isScreenLocked) {
+        if (showControls && isPlaying && !showDrawer && playbackError == null && !isScrubbing && !isScreenLocked) {
             delay(4500)
             showControls = false
+        }
+    }
+
+    LaunchedEffect(showUnlockPill) {
+        if (showUnlockPill) {
+            delay(2500)
+            showUnlockPill = false
+        }
+    }
+
+    LaunchedEffect(hudFeedbackToken) {
+        if (hudFeedbackToken > 0) {
+            delay(1100)
+            hudFeedback = null
+        }
+    }
+
+    LaunchedEffect(sleepTimerEndAtMs) {
+        if (sleepTimerEndAtMs <= 0L) {
+            sleepTimerMinutesLeft = 0
+            return@LaunchedEffect
+        }
+        while (sleepTimerEndAtMs > 0L) {
+            val remainingMs = sleepTimerEndAtMs - System.currentTimeMillis()
+            if (remainingMs <= 0L) {
+                sleepTimerEndAtMs = 0L
+                sleepTimerMinutesLeft = 0
+                exoPlayer.pause()
+                hudFeedback = PlayerHudFeedback.Message(strings.sleepTimerTriggeredMsg)
+                hudFeedbackToken++
+                break
+            }
+            sleepTimerMinutesLeft = ((remainingMs + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
+            delay(5000L)
         }
     }
 
@@ -381,7 +443,13 @@ fun PlayerScreen(
         PlayerResizeMode.ZOOM -> strings.resizeZoom
     }
 
-    val nowMillis = remember(session.currentChannel) { System.currentTimeMillis() }
+    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(session.currentChannel) {
+        while (true) {
+            nowMillis = System.currentTimeMillis()
+            delay(30_000L)
+        }
+    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -443,8 +511,13 @@ fun PlayerScreen(
 
         BackHandler {
             when {
+                isScreenLocked -> {
+                    showUnlockPill = true
+                }
                 showDrawer -> showDrawer = false
-                isLandscape && !isTv -> orientationLock = PlayerOrientationLock.LOCKED_PORTRAIT
+                orientationLock == PlayerOrientationLock.LOCKED_LANDSCAPE && !isTv -> {
+                    orientationLock = PlayerOrientationLock.SYSTEM_DEFAULT
+                }
                 else -> onBack()
             }
         }
@@ -477,13 +550,89 @@ fun PlayerScreen(
             Box(
                 modifier = videoContainerModifier
                     .background(Color.Black)
+                    .onSizeChanged { videoBoxSize = it }
                     .focusable()
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        showControls = !showControls
+                    .pointerInput(isTv, isScreenLocked, isSeekable, activeArchive, durationMs) {
+                        detectTapGestures(
+                            onTap = {
+                                if (isScreenLocked) {
+                                    showUnlockPill = !showUnlockPill
+                                } else {
+                                    showControls = !showControls
+                                }
+                            },
+                            onDoubleTap = { offset ->
+                                if (isScreenLocked || isTv) return@detectTapGestures
+                                val width = videoBoxSize.width.toFloat().coerceAtLeast(1f)
+                                val canSeek = isSeekable || activeArchive != null
+                                if (canSeek && offset.x < width * 0.4f) {
+                                    val target = (exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)
+                                    exoPlayer.seekTo(target)
+                                    currentPositionMs = target
+                                    hudFeedback = PlayerHudFeedback.SeekDelta(-10)
+                                    hudFeedbackToken++
+                                } else if (canSeek && offset.x > width * 0.6f) {
+                                    val maxPos = if (durationMs > 0L) durationMs else Long.MAX_VALUE
+                                    val target = (exoPlayer.currentPosition + 10_000L).coerceAtMost(maxPos)
+                                    exoPlayer.seekTo(target)
+                                    currentPositionMs = target
+                                    hudFeedback = PlayerHudFeedback.SeekDelta(10)
+                                    hudFeedbackToken++
+                                } else {
+                                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                                }
+                            }
+                        )
                     }
+                    .then(
+                        if (!isTv && !isScreenLocked) {
+                            Modifier.pointerInput(videoBoxSize, activity, audioManager) {
+                                var dragIsBrightness = false
+                                var startX = 0f
+                                var accumulatedVolDelta = 0f
+                                detectVerticalDragGestures(
+                                    onDragStart = { startOffset ->
+                                        startX = startOffset.x
+                                        val w = videoBoxSize.width.toFloat().coerceAtLeast(1f)
+                                        dragIsBrightness = startX < w * 0.5f
+                                        accumulatedVolDelta = 0f
+                                    },
+                                    onVerticalDrag = { change, dragAmount ->
+                                        val h = videoBoxSize.height.toFloat().coerceAtLeast(200f)
+                                        val deltaRatio = -dragAmount / (h * 0.75f)
+                                        if (dragIsBrightness) {
+                                            val next = (sessionBrightness + deltaRatio).coerceIn(0.05f, 1.0f)
+                                            sessionBrightness = next
+                                            val w = activity?.window
+                                            if (w != null) {
+                                                val lp = w.attributes
+                                                lp.screenBrightness = next
+                                                w.attributes = lp
+                                            }
+                                            hudFeedback = PlayerHudFeedback.Brightness((next * 100f).toInt())
+                                            hudFeedbackToken++
+                                        } else if (audioManager != null) {
+                                            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                            accumulatedVolDelta += deltaRatio * maxVol
+                                            if (kotlin.math.abs(accumulatedVolDelta) >= 1f) {
+                                                val step = accumulatedVolDelta.toInt()
+                                                accumulatedVolDelta -= step
+                                                val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                                val nextVol = (currentVol + step).coerceIn(0, maxVol)
+                                                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, nextVol, 0)
+                                                val pct = ((nextVol.toFloat() / maxVol) * 100f).toInt()
+                                                hudFeedback = PlayerHudFeedback.Volume(pct)
+                                                hudFeedbackToken++
+                                            }
+                                        }
+                                        change.consume()
+                                    }
+                                )
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
             ) {
                 AndroidView(
                     factory = { ctx ->
@@ -576,9 +725,124 @@ fun PlayerScreen(
                     }
                 }
 
+                // Gesture / Sleep HUD pill
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = hudFeedback != null,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier.align(Alignment.Center)
+                ) {
+                    hudFeedback?.let { feedback ->
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = Color.Black.copy(alpha = 0.78f),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                when (feedback) {
+                                    is PlayerHudFeedback.SeekDelta -> {
+                                        Icon(
+                                            imageVector = if (feedback.seconds < 0) Icons.Filled.Replay10 else Icons.Filled.Forward10,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            text = if (feedback.seconds > 0) "+${feedback.seconds}s" else "${feedback.seconds}s",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = Color.White
+                                        )
+                                    }
+                                    is PlayerHudFeedback.Brightness -> {
+                                        Icon(
+                                            imageVector = Icons.Filled.BrightnessHigh,
+                                            contentDescription = null,
+                                            tint = Color(0xFFFBBF24)
+                                        )
+                                        Text(
+                                            text = strings.brightnessLabel(feedback.percent),
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = Color.White
+                                        )
+                                    }
+                                    is PlayerHudFeedback.Volume -> {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            text = strings.volumeLabel(feedback.percent),
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = Color.White
+                                        )
+                                    }
+                                    is PlayerHudFeedback.Message -> {
+                                        Icon(
+                                            imageVector = Icons.Filled.Bedtime,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            text = feedback.text,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Unlock Screen Pill when Screen Lock is active
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = isScreenLocked && showUnlockPill,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 24.dp)
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable {
+                                isScreenLocked = false
+                                showUnlockPill = false
+                                showControls = true
+                            }
+                            .testTag("player_unlock_button"),
+                        shape = RoundedCornerShape(50),
+                        color = Color.Black.copy(alpha = 0.82f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.LockOpen,
+                                contentDescription = strings.unlockScreen,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "${strings.screenLockedMsg} • ${strings.unlockScreen}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = Color.White
+                            )
+                        }
+                    }
+                }
+
                 // OSD Overlay
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = showControls,
+                    visible = showControls && !isScreenLocked,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier.fillMaxSize()
@@ -710,6 +974,11 @@ fun PlayerScreen(
                                         )
                                     }
                                 }
+
+                                OsButtonSleepTimer(
+                                    minutesLeft = sleepTimerMinutesLeft,
+                                    onClick = { showSleepTimerDialog = true }
+                                )
 
                                 OsdIconButton(
                                     onClick = { onToggleFavorite(session.currentChannel) },
@@ -942,6 +1211,41 @@ fun PlayerScreen(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
+                                    if (isSeekable || activeArchive != null) {
+                                        val speeds = listOf(0.5f, 1.0f, 1.25f, 1.5f, 2.0f)
+                                        Surface(
+                                            modifier = Modifier
+                                                .tvFocusHighlight(shape = RoundedCornerShape(50))
+                                                .clip(RoundedCornerShape(50))
+                                                .clickable {
+                                                    val idx = speeds.indexOfFirst { kotlin.math.abs(it - playbackSpeed) < 0.05f }
+                                                    playbackSpeed = speeds[(idx + 1) % speeds.size]
+                                                }
+                                                .testTag("player_speed_button"),
+                                            shape = RoundedCornerShape(50),
+                                            color = Color.Black.copy(alpha = 0.58f),
+                                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f))
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Speed,
+                                                    contentDescription = strings.playbackSpeed,
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Text(
+                                                    text = if (playbackSpeed == 1.0f) "1x" else "${playbackSpeed}x",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color.White
+                                                )
+                                            }
+                                        }
+                                    }
+
                                     Surface(
                                         modifier = Modifier
                                             .tvFocusHighlight(shape = RoundedCornerShape(50))
@@ -972,6 +1276,21 @@ fun PlayerScreen(
                                     }
 
                                     if (!isTv) {
+                                        OsdIconButton(
+                                            onClick = {
+                                                isScreenLocked = true
+                                                showControls = false
+                                                showUnlockPill = true
+                                            },
+                                            testTag = "player_lock_button"
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Lock,
+                                                contentDescription = strings.lockScreen,
+                                                tint = Color.White
+                                            )
+                                        }
+
                                         OsdIconButton(
                                             onClick = {
                                                 orientationLock = if (isLandscape) {
@@ -1092,6 +1411,21 @@ fun PlayerScreen(
                     )
                 }
             }
+        }
+
+        if (showSleepTimerDialog) {
+            SleepTimerDialog(
+                currentMinutesLeft = sleepTimerMinutesLeft,
+                onSelectMinutes = { minutes ->
+                    sleepTimerEndAtMs = if (minutes <= 0) {
+                        0L
+                    } else {
+                        System.currentTimeMillis() + minutes * 60_000L
+                    }
+                    showSleepTimerDialog = false
+                },
+                onDismiss = { showSleepTimerDialog = false }
+            )
         }
     }
 }
@@ -1608,6 +1942,115 @@ private fun classifyPlaybackError(error: Throwable): PlayerErrorState {
         depth++
     }
     return PlayerErrorState.Generic(error.localizedMessage ?: error.message ?: "Playback error")
+}
+
+@Composable
+private fun OsButtonSleepTimer(
+    minutesLeft: Int,
+    onClick: () -> Unit
+) {
+    val strings = LocalAppStrings.current
+    if (minutesLeft > 0) {
+        Surface(
+            modifier = Modifier
+                .tvFocusHighlight(shape = RoundedCornerShape(50))
+                .clip(RoundedCornerShape(50))
+                .clickable(onClick = onClick)
+                .testTag("player_sleep_timer_button"),
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Bedtime,
+                    contentDescription = strings.sleepTimerTitle,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = strings.sleepTimerRemaining(minutesLeft),
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = Color.White
+                )
+            }
+        }
+    } else {
+        OsdIconButton(
+            onClick = onClick,
+            testTag = "player_sleep_timer_button"
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Bedtime,
+                contentDescription = strings.sleepTimerTitle,
+                tint = Color.White
+            )
+        }
+    }
+}
+
+@Composable
+private fun SleepTimerDialog(
+    currentMinutesLeft: Int,
+    onSelectMinutes: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val strings = LocalAppStrings.current
+    val options = listOf(0, 15, 30, 60, 90)
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        shape = RoundedCornerShape(24.dp),
+        title = {
+            Text(
+                text = strings.sleepTimerTitle,
+                style = MaterialTheme.typography.titleLarge
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                options.forEach { min ->
+                    val label = if (min == 0) strings.sleepTimerOff else strings.sleepTimerMinutes(min)
+                    val isSelected = (min == 0 && currentMinutesLeft == 0) ||
+                        (min > 0 && currentMinutesLeft in (min - 1)..min)
+                    val rowShape = RoundedCornerShape(14.dp)
+                    Surface(
+                        shape = rowShape,
+                        color = if (isSelected) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        },
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(rowShape)
+                            .clickable { onSelectMinutes(min) }
+                            .testTag("sleep_timer_option_$min")
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) {
+                Text(strings.cancel)
+            }
+        }
+    )
 }
 
 @Composable

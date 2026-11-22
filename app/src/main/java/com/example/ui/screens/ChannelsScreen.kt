@@ -46,11 +46,16 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -73,6 +78,7 @@ import com.example.ui.viewmodel.TeleWaveUiState
 fun ChannelsScreen(
     uiState: TeleWaveUiState,
     isTv: Boolean,
+    searchFocusRequestTick: Int = 0,
     onSelectPlaylist: (Long?) -> Unit,
     onSelectCategory: (String?) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -80,6 +86,7 @@ fun ChannelsScreen(
     onRefresh: () -> Unit,
     onManagePlaylists: () -> Unit,
     onClearFilters: () -> Unit,
+    onClearRecents: () -> Unit = {},
     onPlayChannel: (ChannelItem, List<ChannelItem>) -> Unit,
     onToggleFavorite: (ChannelItem) -> Unit,
     modifier: Modifier = Modifier
@@ -87,6 +94,13 @@ fun ChannelsScreen(
     val strings = LocalAppStrings.current
     val enabledPlaylists = uiState.playlists.filter { it.isEnabled }
     val playingUrl = uiState.playerSession?.currentChannel?.streamUrl
+    val searchFocusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(searchFocusRequestTick) {
+        if (searchFocusRequestTick > 0) {
+            runCatching { searchFocusRequester.requestFocus() }
+        }
+    }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val isWide = maxWidth >= 700.dp || isTv
@@ -195,6 +209,7 @@ fun ChannelsScreen(
                         ),
                         modifier = Modifier
                             .weight(1f)
+                            .focusRequester(searchFocusRequester)
                             .testTag("channels_search_input")
                     )
 
@@ -368,7 +383,8 @@ fun ChannelsScreen(
                             item(span = { GridItemSpan(maxLineSpan) }, key = "recent_strip") {
                                 RecentHeroStrip(
                                     recents = uiState.recentChannels,
-                                    onPlay = { ch -> onPlayChannel(ch, uiState.filteredChannels) }
+                                    onPlay = { ch -> onPlayChannel(ch, uiState.filteredChannels) },
+                                    onClearRecents = onClearRecents
                                 )
                             }
                         }
@@ -406,7 +422,8 @@ fun ChannelsScreen(
                             item(key = "recent_strip_list") {
                                 RecentHeroStrip(
                                     recents = uiState.recentChannels,
-                                    onPlay = { ch -> onPlayChannel(ch, uiState.filteredChannels) }
+                                    onPlay = { ch -> onPlayChannel(ch, uiState.filteredChannels) },
+                                    onClearRecents = onClearRecents
                                 )
                             }
                         }
@@ -433,7 +450,8 @@ fun ChannelsScreen(
 @Composable
 private fun RecentHeroStrip(
     recents: List<ChannelItem>,
-    onPlay: (ChannelItem) -> Unit
+    onPlay: (ChannelItem) -> Unit,
+    onClearRecents: () -> Unit
 ) {
     val strings = LocalAppStrings.current
     val shape = RoundedCornerShape(20.dp)
@@ -470,20 +488,36 @@ private fun RecentHeroStrip(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.PlayArrow,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Text(
-                        text = strings.continueWatching,
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = strings.continueWatching,
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    TextButton(
+                        onClick = onClearRecents,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("clear_recents_button")
+                    ) {
+                        Text(
+                            text = strings.clearRecent,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
                 }
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {

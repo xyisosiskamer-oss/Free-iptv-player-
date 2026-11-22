@@ -60,9 +60,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import com.example.R
 import com.example.i18n.LocalAppStrings
 import com.example.i18n.stringsFor
+import com.example.ui.components.IncomingImportDialog
 import com.example.ui.components.LanguageSwitcherChip
 import com.example.ui.components.isTelevisionDevice
 import com.example.ui.components.tvFocusHighlight
@@ -83,6 +86,7 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
     val context = LocalContext.current
     val isTv = remember(context) { isTelevisionDevice(context) }
     val snackbarHostState = remember { SnackbarHostState() }
+    var searchFocusRequestTick by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(Unit) {
         viewModel.snackbarEvents.collect { msg ->
@@ -132,7 +136,10 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
                                 subtitle = strings.tagline,
                                 language = uiState.language,
                                 onSelectLanguage = { viewModel.setLanguage(it) },
-                                onOpenSearch = { viewModel.selectTab(AppTab.CHANNELS) },
+                                onOpenSearch = {
+                                    viewModel.selectTab(AppTab.CHANNELS)
+                                    searchFocusRequestTick++
+                                },
                                 modifier = Modifier.statusBarsPadding()
                             )
                         },
@@ -170,6 +177,7 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
                                     AppTab.CHANNELS -> ChannelsScreen(
                                         uiState = uiState,
                                         isTv = isTv,
+                                        searchFocusRequestTick = searchFocusRequestTick,
                                         onSelectPlaylist = { viewModel.selectActivePlaylist(it) },
                                         onSelectCategory = { viewModel.selectCategory(it) },
                                         onSearchQueryChange = { viewModel.updateSearchQuery(it) },
@@ -177,6 +185,7 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
                                         onRefresh = { viewModel.refreshActiveOrAllPlaylists() },
                                         onManagePlaylists = { viewModel.selectTab(AppTab.PLAYLISTS) },
                                         onClearFilters = { viewModel.clearChannelFilters() },
+                                        onClearRecents = { viewModel.clearRecentChannels() },
                                         onPlayChannel = { ch, queue -> viewModel.playChannel(ch, queue) },
                                         onToggleFavorite = { ch -> viewModel.toggleFavorite(ch) }
                                     )
@@ -229,6 +238,18 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
                         }
                     }
                 }
+            }
+
+            uiState.pendingExternalImport?.let { pending ->
+                IncomingImportDialog(
+                    pending = pending,
+                    existingPlaylists = uiState.playlists,
+                    onDismiss = { viewModel.dismissIncomingImport() },
+                    onImportAsNew = { customName -> viewModel.confirmIncomingAsNew(customName) },
+                    onReplacePlaylist = { targetId, customName ->
+                        viewModel.confirmIncomingReplace(targetId, customName)
+                    }
+                )
             }
         }
     }

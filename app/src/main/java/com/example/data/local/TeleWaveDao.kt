@@ -66,7 +66,13 @@ interface TeleWaveDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertRecent(recent: RecentChannelEntity)
 
+    @Query("DELETE FROM recent_channels")
+    suspend fun clearRecentChannels()
+
     // EPG queries
+    @Query("SELECT * FROM epg_programs ORDER BY startTimeMillis ASC")
+    fun observeAllEpgPrograms(): Flow<List<EpgProgramEntity>>
+
     @Query("SELECT * FROM epg_programs WHERE endTimeMillis >= :fromMillis ORDER BY startTimeMillis ASC")
     fun observeUpcomingEpgPrograms(fromMillis: Long): Flow<List<EpgProgramEntity>>
 

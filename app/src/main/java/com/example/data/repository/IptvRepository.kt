@@ -13,6 +13,7 @@ import com.example.data.model.ChannelItem
 import com.example.data.model.EpgProgramUi
 import com.example.data.parser.M3uParser
 import com.example.data.parser.ParsedChannel
+import com.example.data.parser.PlaylistImportValidator
 import com.example.data.parser.XmltvParser
 import com.example.data.preferences.UserPreferencesRepository
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -54,10 +56,13 @@ class IptvRepository(
     val epgProgramCountFlow: Flow<Int> = dao.observeEpgProgramCount()
 
     private val epgLookupFlow: Flow<EpgLookup> = combine(
-        dao.observeUpcomingEpgPrograms(System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000),
+        dao.observeAllEpgPrograms(),
         dao.observeEpgAliases()
     ) { programs, aliases ->
-        val groupedPrograms = programs.groupBy { it.channelKey }
+        val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+        val groupedPrograms = programs
+            .filter { it.endTimeMillis >= cutoff }
+            .groupBy { it.channelKey }
         val aliasMap = aliases.associate { it.displayNameNormalized to it.channelKey }
         EpgLookup(groupedPrograms, aliasMap)
     }
@@ -244,6 +249,66 @@ class IptvRepository(
             syncEpgFromUrl(resolvedEpg)
         }
         return Result.success(id to parseResult.channels.size)
+    }
+
+    suspend fun replacePlaylistWithLocalContent(
+        targetPlaylistId: Long,
+        newName: String,
+        sourceLabel: String,
+        rawContent: String,
+        manualEpgUrl: String? = null
+    ): Result<Pair<Long, Int>> {
+        val existing = dao.getPlaylistById(targetPlaylistId)
+            ?: return Result.failure(IllegalStateException("Playlist not found"))
+        val parseResult = withContext(Dispatchers.Default) { M3uParser.parsePlaylist(rawContent) }
+        if (parseResult.channels.isEmpty()) {
+            return Result.failure(IllegalArgumentException("No channels found in M3U"))
+        }
+        val resolvedEpg = manualEpgUrl?.trim()?.takeIf { it.isNotBlank() }
+            ?: parseResult.epgUrl
+            ?: existing.epgUrl
+        dao.updatePlaylist(
+            existing.copy(
+                name = newName.trim().ifBlank { existing.name },
+                url = sourceLabel,
+                epgUrl = resolvedEpg,
+                isEnabled = true,
+                isLocalFile = true,
+                channelCount = parseResult.channels.size,
+                lastUpdatedAt = System.currentTimeMillis(),
+                lastError = null
+            )
+        )
+        dao.replacePlaylistChannels(existing.id, parseResult.channels.toEntities(existing.id))
+        if (!resolvedEpg.isNullOrBlank()) {
+            syncEpgFromUrl(resolvedEpg)
+        }
+        return Result.success(existing.id to parseResult.channels.size)
+    }
+
+    suspend fun replacePlaylistWithUrl(
+        targetPlaylistId: Long,
+        newName: String,
+        newUrl: String,
+        newEpgUrl: String? = null
+    ): Result<Pair<Long, Int>> {
+        val existing = dao.getPlaylistById(targetPlaylistId)
+            ?: return Result.failure(IllegalStateException("Playlist not found"))
+        val cleanEpg = newEpgUrl?.trim()?.takeIf { it.isNotBlank() } ?: existing.epgUrl
+        dao.updatePlaylist(
+            existing.copy(
+                name = newName.trim().ifBlank { existing.name },
+                url = newUrl.trim(),
+                epgUrl = cleanEpg,
+                isEnabled = true,
+                isLocalFile = false
+            )
+        )
+        val syncResult = refreshPlaylist(existing.id)
+        if (syncResult.isSuccess) {
+            dao.getPlaylistById(existing.id)?.epgUrl?.let { syncEpgFromUrl(it) }
+        }
+        return syncResult.map { count -> existing.id to count }
     }
 
     suspend fun updatePlaylist(
@@ -438,12 +503,30 @@ class IptvRepository(
         )
     }
 
+    suspend fun clearRecentChannels() {
+        dao.clearRecentChannels()
+    }
+
     suspend fun readTextFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val text = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use {
-                it.readText()
-            } ?: return@withContext Result.failure(IOException("Unable to open file"))
-            Result.success(text)
+            val maxBytes = PlaylistImportValidator.MAX_LOCAL_M3U_BYTES
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(16 * 1024)
+                val out = ByteArrayOutputStream()
+                var totalRead = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    totalRead += read
+                    if (totalRead > maxBytes) {
+                        return@withContext Result.failure(
+                            IOException("File is too large (max ${maxBytes / (1024 * 1024)} MB)")
+                        )
+                    }
+                    out.write(buffer, 0, read)
+                }
+                Result.success(out.toString(Charsets.UTF_8.name()))
+            } ?: Result.failure(IOException("Unable to open file"))
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -460,7 +543,13 @@ class IptvRepository(
             if (!response.isSuccessful) {
                 throw IOException("HTTP ${response.code}")
             }
-            response.body?.string() ?: throw IOException("Empty response")
+            val body = response.body ?: throw IOException("Empty response")
+            val contentLength = body.contentLength()
+            val maxBytes = 20L * 1024L * 1024L
+            if (contentLength > maxBytes) {
+                throw IOException("Playlist is too large")
+            }
+            body.string()
         }
     }
 
