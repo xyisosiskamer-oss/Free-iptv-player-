@@ -177,11 +177,29 @@ fun ChannelGridCard(
                         )
                     }
 
-                    Text(
-                        text = "#${indexNumber.toString().padStart(2, '0')}",
-                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (channel.hasCatchup) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    text = strings.archiveBadge,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = "#${indexNumber.toString().padStart(2, '0')}",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
             }
         }
@@ -301,6 +319,21 @@ fun ChannelListRow(
                             )
                         }
                     }
+                }
+            }
+
+            if (channel.hasCatchup) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                ) {
+                    Text(
+                        text = strings.archiveBadge,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                    )
                 }
             }
 

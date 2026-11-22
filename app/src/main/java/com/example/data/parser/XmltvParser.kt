@@ -32,7 +32,7 @@ object XmltvParser {
 
     fun parse(
         inputStream: InputStream,
-        windowStartMillis: Long = System.currentTimeMillis() - 12L * 60 * 60 * 1000,
+        windowStartMillis: Long = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000,
         windowEndMillis: Long = System.currentTimeMillis() + 48L * 60 * 60 * 1000
     ): XmltvParseResult {
         val buffered = BufferedInputStream(inputStream, 16 * 1024)

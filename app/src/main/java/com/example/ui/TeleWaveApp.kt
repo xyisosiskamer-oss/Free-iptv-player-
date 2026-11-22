@@ -105,7 +105,9 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
                     onNextChannel = { viewModel.zapNextChannel() },
                     onPreviousChannel = { viewModel.zapPreviousChannel() },
                     onToggleFavorite = { ch -> viewModel.toggleFavorite(ch) },
-                    onCycleResizeMode = { viewModel.cycleResizeMode() }
+                    onCycleResizeMode = { viewModel.cycleResizeMode() },
+                    onPlayArchiveProgram = { prog -> viewModel.playArchiveProgram(prog) },
+                    onReturnToLive = { viewModel.returnToLive() }
                 )
             } else {
                 BackHandler(enabled = uiState.currentTab != AppTab.CHANNELS) {

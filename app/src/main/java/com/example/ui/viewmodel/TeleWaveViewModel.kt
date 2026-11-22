@@ -7,6 +7,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.PlaylistEntity
 import com.example.data.local.TeleWaveDatabase
 import com.example.data.model.ChannelItem
+import com.example.data.model.EpgProgramUi
+import com.example.data.parser.CatchupUrlBuilder
 import com.example.data.preferences.ChannelViewMode
 import com.example.data.preferences.PlayerResizeMode
 import com.example.data.preferences.UserPreferencesRepository
@@ -30,9 +32,15 @@ enum class AppTab {
     SETTINGS
 }
 
+data class ArchivePlayback(
+    val program: EpgProgramUi,
+    val archiveUrl: String
+)
+
 data class PlayerSession(
     val currentChannel: ChannelItem,
-    val queue: List<ChannelItem>
+    val queue: List<ChannelItem>,
+    val archivePlayback: ArchivePlayback? = null
 )
 
 data class TeleWaveUiState(
@@ -175,9 +183,13 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
                 referrer = rec.referrer,
                 position = idx,
                 isFavorite = favUrls.contains(rec.streamUrl),
+                catchupType = matched?.catchupType,
+                catchupDays = matched?.catchupDays ?: 0,
+                catchupSource = matched?.catchupSource,
                 currentProgram = matched?.currentProgram,
                 nextProgram = matched?.nextProgram,
-                schedule = matched?.schedule ?: emptyList()
+                schedule = matched?.schedule ?: emptyList(),
+                archivePrograms = matched?.archivePrograms ?: emptyList()
             )
         }
 
@@ -382,6 +394,21 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
         val idx = queue.indexOfFirst { it.streamUrl == session.currentChannel.streamUrl }
         val prevIdx = if (idx <= 0) queue.lastIndex else idx - 1
         switchPlayerChannel(queue[prevIdx])
+    }
+
+    fun playArchiveProgram(program: EpgProgramUi) {
+        val currentSession = playerSessionFlow.value ?: return
+        val archiveUrl = CatchupUrlBuilder.buildArchiveUrl(currentSession.currentChannel, program)
+        playerSessionFlow.value = currentSession.copy(
+            archivePlayback = ArchivePlayback(program = program, archiveUrl = archiveUrl)
+        )
+    }
+
+    fun returnToLive() {
+        val currentSession = playerSessionFlow.value ?: return
+        if (currentSession.archivePlayback != null) {
+            playerSessionFlow.value = currentSession.copy(archivePlayback = null)
+        }
     }
 
     fun closePlayer() {

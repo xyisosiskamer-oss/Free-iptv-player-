@@ -27,5 +27,8 @@ data class ChannelEntity(
     val tvgId: String?,
     val userAgent: String?,
     val referrer: String?,
-    val position: Int
+    val position: Int,
+    val catchupType: String? = null,
+    val catchupDays: Int = 0,
+    val catchupSource: String? = null
 )

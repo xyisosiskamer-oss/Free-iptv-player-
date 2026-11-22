@@ -8,7 +8,10 @@ data class ParsedChannel(
     val tvgId: String?,
     val userAgent: String?,
     val referrer: String?,
-    val position: Int
+    val position: Int,
+    val catchupType: String? = null,
+    val catchupDays: Int = 0,
+    val catchupSource: String? = null
 )
 
 data class M3uParseResult(
@@ -32,12 +35,19 @@ object M3uParser {
 
         val channels = mutableListOf<ParsedChannel>()
         var discoveredEpgUrl: String? = null
+        var defaultCatchupType: String? = null
+        var defaultCatchupDays = 0
+        var defaultCatchupSource: String? = null
+
         var pendingName: String? = null
         var pendingLogo: String? = null
         var pendingGroup: String = ""
         var pendingTvgId: String? = null
         var pendingUserAgent: String? = null
         var pendingReferrer: String? = null
+        var pendingCatchupType: String? = null
+        var pendingCatchupDays = 0
+        var pendingCatchupSource: String? = null
         var hasMetadataForNextUrl = false
 
         for (line in lines) {
@@ -56,6 +66,10 @@ object M3uParser {
                                     it.startsWith("https://", ignoreCase = true)
                             }
                     }
+                    defaultCatchupType = (attrs["catchup"] ?: attrs["catchup-type"])?.takeIf { it.isNotBlank() }
+                    defaultCatchupDays = (attrs["catchup-days"] ?: attrs["tvg-rec"] ?: attrs["timeshift"])
+                        ?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                    defaultCatchupSource = attrs["catchup-source"]?.takeIf { it.isNotBlank() }
                 }
 
                 line.startsWith("#EXTINF", ignoreCase = true) -> {
@@ -71,6 +85,14 @@ object M3uParser {
                     pendingGroup = attrs["group-title"]?.trim().orEmpty()
                     val tvgName = attrs["tvg-name"]?.takeIf { it.isNotBlank() }
                     pendingName = titlePart.ifBlank { tvgName } ?: "TV Channel"
+
+                    pendingCatchupType = (attrs["catchup"] ?: attrs["catchup-type"])
+                        ?.takeIf { it.isNotBlank() } ?: defaultCatchupType
+                    pendingCatchupDays = (attrs["catchup-days"] ?: attrs["tvg-rec"] ?: attrs["timeshift"])
+                        ?.toIntOrNull()?.coerceAtLeast(0) ?: defaultCatchupDays
+                    pendingCatchupSource = attrs["catchup-source"]?.takeIf { it.isNotBlank() }
+                        ?: defaultCatchupSource
+
                     hasMetadataForNextUrl = true
                 }
 
@@ -108,7 +130,10 @@ object M3uParser {
                             tvgId = pendingTvgId,
                             userAgent = inlineUa ?: pendingUserAgent,
                             referrer = inlineRef ?: pendingReferrer,
-                            position = channels.size
+                            position = channels.size,
+                            catchupType = pendingCatchupType ?: defaultCatchupType,
+                            catchupDays = if (hasMetadataForNextUrl) pendingCatchupDays else defaultCatchupDays,
+                            catchupSource = pendingCatchupSource ?: defaultCatchupSource
                         )
                     )
                     pendingName = null
@@ -117,6 +142,9 @@ object M3uParser {
                     pendingTvgId = null
                     pendingUserAgent = null
                     pendingReferrer = null
+                    pendingCatchupType = null
+                    pendingCatchupDays = 0
+                    pendingCatchupSource = null
                     hasMetadataForNextUrl = false
                 }
 

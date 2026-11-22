@@ -54,7 +54,7 @@ class IptvRepository(
     val epgProgramCountFlow: Flow<Int> = dao.observeEpgProgramCount()
 
     private val epgLookupFlow: Flow<EpgLookup> = combine(
-        dao.observeUpcomingEpgPrograms(System.currentTimeMillis() - 6L * 60 * 60 * 1000),
+        dao.observeUpcomingEpgPrograms(System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000),
         dao.observeEpgAliases()
     ) { programs, aliases ->
         val groupedPrograms = programs.groupBy { it.channelKey }
@@ -76,7 +76,7 @@ class IptvRepository(
             if (playlist != null && !playlist.isEnabled) {
                 null
             } else {
-                val (current, next, schedule) = resolveEpgForChannel(ch.tvgId, ch.name, epg, now)
+                val resolved = resolveEpgForChannel(ch.tvgId, ch.name, ch.catchupDays, epg, now)
                 ChannelItem(
                     id = ch.id,
                     playlistId = ch.playlistId,
@@ -90,9 +90,13 @@ class IptvRepository(
                     referrer = ch.referrer,
                     position = ch.position,
                     isFavorite = favoriteUrls.contains(ch.streamUrl),
-                    currentProgram = current,
-                    nextProgram = next,
-                    schedule = schedule
+                    catchupType = ch.catchupType,
+                    catchupDays = ch.catchupDays,
+                    catchupSource = ch.catchupSource,
+                    currentProgram = resolved.current,
+                    nextProgram = resolved.next,
+                    schedule = resolved.schedule,
+                    archivePrograms = resolved.archivePrograms
                 )
             }
         }
@@ -105,11 +109,13 @@ class IptvRepository(
         epgLookupFlow
     ) { favorites, playlists, allChannels, epg ->
         val playlistMap = playlists.associateBy { it.id }
-        val tvgIdByUrl = allChannels.associate { it.streamUrl to it.tvgId }
+        val channelByUrl = allChannels.associateBy { it.streamUrl }
         val now = System.currentTimeMillis()
         favorites.mapIndexed { index, fav ->
-            val tvgId = tvgIdByUrl[fav.streamUrl]
-            val (current, next, schedule) = resolveEpgForChannel(tvgId, fav.name, epg, now)
+            val matched = channelByUrl[fav.streamUrl]
+            val tvgId = matched?.tvgId
+            val catchupDays = matched?.catchupDays ?: 0
+            val resolved = resolveEpgForChannel(tvgId, fav.name, catchupDays, epg, now)
             ChannelItem(
                 id = -1L - index,
                 playlistId = fav.playlistId,
@@ -123,9 +129,13 @@ class IptvRepository(
                 referrer = fav.referrer,
                 position = index,
                 isFavorite = true,
-                currentProgram = current,
-                nextProgram = next,
-                schedule = schedule
+                catchupType = matched?.catchupType,
+                catchupDays = catchupDays,
+                catchupSource = matched?.catchupSource,
+                currentProgram = resolved.current,
+                nextProgram = resolved.next,
+                schedule = resolved.schedule,
+                archivePrograms = resolved.archivePrograms
             )
         }
     }
@@ -328,7 +338,7 @@ class IptvRepository(
 
         var totalPrograms = 0
         var lastFailure: Throwable? = null
-        dao.pruneOldEpgPrograms(System.currentTimeMillis() - 12L * 60 * 60 * 1000)
+        dao.pruneOldEpgPrograms(System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000)
 
         for (epgUrl in urls) {
             syncEpgFromUrl(epgUrl)
@@ -457,10 +467,11 @@ class IptvRepository(
     private fun resolveEpgForChannel(
         tvgId: String?,
         channelName: String,
+        catchupDays: Int,
         epg: EpgLookup,
         nowMillis: Long
-    ): Triple<EpgProgramUi?, EpgProgramUi?, List<EpgProgramUi>> {
-        if (epg.programsByKey.isEmpty()) return Triple(null, null, emptyList())
+    ): EpgResolved {
+        if (epg.programsByKey.isEmpty()) return EpgResolved(null, null, emptyList(), emptyList())
 
         val candidates = buildList {
             if (!tvgId.isNullOrBlank()) {
@@ -473,10 +484,9 @@ class IptvRepository(
 
         val matchedPrograms = candidates.firstNotNullOfOrNull { key ->
             epg.programsByKey[key]?.takeIf { it.isNotEmpty() }
-        } ?: return Triple(null, null, emptyList())
+        } ?: return EpgResolved(null, null, emptyList(), emptyList())
 
-        val upcoming = matchedPrograms
-            .filter { it.endTimeMillis >= nowMillis }
+        val allSorted = matchedPrograms
             .sortedBy { it.startTimeMillis }
             .map {
                 EpgProgramUi(
@@ -488,6 +498,7 @@ class IptvRepository(
                 )
             }
 
+        val upcoming = allSorted.filter { it.endTimeMillis > nowMillis }
         val current = upcoming.firstOrNull { nowMillis in it.startTimeMillis..it.endTimeMillis }
         val next = if (current != null) {
             upcoming.firstOrNull { it.startTimeMillis >= current.endTimeMillis }
@@ -495,7 +506,19 @@ class IptvRepository(
             upcoming.firstOrNull { it.startTimeMillis > nowMillis }
         }
 
-        return Triple(current, next, upcoming.take(24))
+        val maxArchiveDays = if (catchupDays > 0) catchupDays.coerceAtMost(14) else 7
+        val archiveCutoff = nowMillis - maxArchiveDays.toLong() * 24L * 60 * 60 * 1000L
+        val archivePrograms = allSorted
+            .filter { it.endTimeMillis <= nowMillis && it.endTimeMillis >= archiveCutoff }
+            .sortedByDescending { it.startTimeMillis }
+            .take(80)
+
+        return EpgResolved(
+            current = current,
+            next = next,
+            schedule = upcoming.take(24),
+            archivePrograms = archivePrograms
+        )
     }
 
     private fun List<ParsedChannel>.toEntities(playlistId: Long): List<ChannelEntity> {
@@ -509,10 +532,20 @@ class IptvRepository(
                 tvgId = ch.tvgId,
                 userAgent = ch.userAgent,
                 referrer = ch.referrer,
-                position = ch.position
+                position = ch.position,
+                catchupType = ch.catchupType,
+                catchupDays = ch.catchupDays,
+                catchupSource = ch.catchupSource
             )
         }
     }
+
+    private data class EpgResolved(
+        val current: EpgProgramUi?,
+        val next: EpgProgramUi?,
+        val schedule: List<EpgProgramUi>,
+        val archivePrograms: List<EpgProgramUi>
+    )
 
     private data class EpgLookup(
         val programsByKey: Map<String, List<EpgProgramEntity>>,

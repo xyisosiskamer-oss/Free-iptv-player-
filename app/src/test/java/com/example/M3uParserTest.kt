@@ -1,5 +1,8 @@
 package com.example
 
+import com.example.data.model.ChannelItem
+import com.example.data.model.EpgProgramUi
+import com.example.data.parser.CatchupUrlBuilder
 import com.example.data.parser.M3uParser
 import com.example.data.parser.XmltvParser
 import org.junit.Assert.assertEquals
@@ -43,6 +46,65 @@ class M3uParserTest {
         assertEquals("Первый канал", channels[2].name)
         assertEquals("", channels[2].groupTitle)
         assertNull(channels[2].logoUrl)
+    }
+
+    @Test
+    fun parsesCatchupAttributesAndBuildsArchiveUrls() {
+        val sample = """
+            #EXTM3U catchup="flussonic" catchup-days="5"
+            #EXTINF:-1 tvg-id="ch1",News HD
+            https://cdn.example.com/ch1/index.m3u8?token=abc
+            #EXTINF:-1 catchup="append" catchup-days="3" catchup-source="?utc=${'$'}{start}&dur=${'$'}{duration}",Movies
+            https://cdn.example.com/movies/playlist.m3u8
+        """.trimIndent()
+
+        val channels = M3uParser.parsePlaylist(sample).channels
+        assertEquals(2, channels.size)
+        assertEquals("flussonic", channels[0].catchupType)
+        assertEquals(5, channels[0].catchupDays)
+        assertEquals("append", channels[1].catchupType)
+        assertEquals(3, channels[1].catchupDays)
+
+        val program = EpgProgramUi(
+            title = "Evening News",
+            description = null,
+            category = null,
+            startTimeMillis = 1_700_000_000_000L,
+            endTimeMillis = 1_700_003_600_000L
+        )
+
+        val ch0Item = ChannelItem(
+            id = 1,
+            playlistId = 1,
+            playlistName = "Test",
+            name = channels[0].name,
+            streamUrl = channels[0].streamUrl,
+            logoUrl = null,
+            groupTitle = "",
+            tvgId = channels[0].tvgId,
+            userAgent = null,
+            referrer = null,
+            position = 0,
+            isFavorite = false,
+            catchupType = channels[0].catchupType,
+            catchupDays = channels[0].catchupDays,
+            catchupSource = channels[0].catchupSource
+        )
+        assertEquals(
+            "https://cdn.example.com/ch1/archive-1700000000-3600.m3u8?token=abc",
+            CatchupUrlBuilder.buildArchiveUrl(ch0Item, program, nowMillis = 1_700_010_000_000L)
+        )
+
+        val ch1Item = ch0Item.copy(
+            streamUrl = channels[1].streamUrl,
+            catchupType = channels[1].catchupType,
+            catchupDays = channels[1].catchupDays,
+            catchupSource = channels[1].catchupSource
+        )
+        assertEquals(
+            "https://cdn.example.com/movies/playlist.m3u8?utc=1700000000&dur=3600",
+            CatchupUrlBuilder.buildArchiveUrl(ch1Item, program, nowMillis = 1_700_010_000_000L)
+        )
     }
 
     @Test
