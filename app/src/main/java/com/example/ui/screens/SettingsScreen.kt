@@ -358,11 +358,22 @@ fun SettingsScreen(
 
                     Button(
                         onClick = onRefreshAll,
+                        enabled = !uiState.isSyncing,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(Icons.Filled.Refresh, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(strings.refreshAllPlaylists)
+                        if (uiState.isSyncing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(strings.syncingPlaylist)
+                        } else {
+                            Icon(Icons.Filled.Refresh, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(strings.refreshAllPlaylists)
+                        }
                     }
                 }
             }

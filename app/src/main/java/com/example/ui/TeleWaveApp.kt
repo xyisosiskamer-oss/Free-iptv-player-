@@ -98,12 +98,26 @@ fun TeleWaveApp(viewModel: TeleWaveViewModel) {
         CompositionLocalProvider(LocalAppStrings provides strings) {
             val activeSession = uiState.playerSession
             if (activeSession != null) {
+                val activeChannelPlaylist = uiState.playlists.firstOrNull {
+                    it.id == activeSession.currentChannel.playlistId
+                }
+                val isPlaylistRemote = activeChannelPlaylist?.isLocalFile == false
+                val isRefreshingPlaylist = uiState.isSyncing ||
+                    uiState.syncingPlaylistIds.contains(activeSession.currentChannel.playlistId)
                 PlayerScreen(
                     session = activeSession,
                     favoriteChannels = uiState.favoriteChannels,
                     resizeMode = uiState.resizeMode,
                     isTv = isTv,
                     httpClient = viewModel.repository.playerHttpClient,
+                    isPlaylistRemote = isPlaylistRemote,
+                    isRefreshingPlaylist = isRefreshingPlaylist,
+                    onRefreshPlaylist = { isAuto ->
+                        viewModel.refreshPlaylistForPlayer(
+                            playlistId = activeSession.currentChannel.playlistId,
+                            isAutoRetry = isAuto
+                        )
+                    },
                     onBack = { viewModel.closePlayer() },
                     onSelectChannel = { ch -> viewModel.switchPlayerChannel(ch) },
                     onNextChannel = { viewModel.zapNextChannel() },

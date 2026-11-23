@@ -238,7 +238,7 @@ fun FavoritesScreen(
                 ) {
                     itemsIndexed(
                         items = uiState.filteredFavorites,
-                        key = { _, item -> "fav_${item.streamUrl}" }
+                        key = { idx, item -> "fav_grid_${idx}_${item.playlistId}_${item.streamUrl}" }
                     ) { idx, channel ->
                         ChannelGridCard(
                             channel = channel,
@@ -262,7 +262,7 @@ fun FavoritesScreen(
                 ) {
                     itemsIndexed(
                         items = uiState.filteredFavorites,
-                        key = { _, item -> "fav_${item.streamUrl}" }
+                        key = { idx, item -> "fav_list_${idx}_${item.playlistId}_${item.streamUrl}" }
                     ) { idx, channel ->
                         ChannelListRow(
                             channel = channel,

@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -59,6 +61,7 @@ import com.example.ui.viewmodel.TeleWaveUiState
 import java.text.DateFormat
 import java.util.Date
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun PlaylistsScreen(
     uiState: TeleWaveUiState,
@@ -152,7 +155,10 @@ fun PlaylistsScreen(
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
                                 OutlinedButton(onClick = onRestoreDefaultPlaylist) {
                                     Icon(Icons.Filled.Restore, contentDescription = null)
                                     Spacer(Modifier.width(6.dp))

@@ -108,6 +108,28 @@ class M3uParserTest {
     }
 
     @Test
+    fun parsesRelativeUrlsAndExtinfHeaderAttributes() {
+        val sample = """
+            #EXTM3U
+            #EXTINF:-1 user-agent="PlayerUA/3.0" referer="https://portal.example.net/",Channel One
+            /live/ch1/index.m3u8?token=xyz
+            #EXTINF:-1 http-user-agent="AltUA/1.2" http-referrer="https://alt.example.net/",Channel Two
+            streams/ch2.m3u8
+        """.trimIndent()
+
+        val result = M3uParser.parsePlaylist(sample, baseUrl = "https://cdn.example.net/list/playlist.m3u")
+        assertEquals(2, result.channels.size)
+
+        assertEquals("https://cdn.example.net/live/ch1/index.m3u8?token=xyz", result.channels[0].streamUrl)
+        assertEquals("PlayerUA/3.0", result.channels[0].userAgent)
+        assertEquals("https://portal.example.net/", result.channels[0].referrer)
+
+        assertEquals("https://cdn.example.net/list/streams/ch2.m3u8", result.channels[1].streamUrl)
+        assertEquals("AltUA/1.2", result.channels[1].userAgent)
+        assertEquals("https://alt.example.net/", result.channels[1].referrer)
+    }
+
+    @Test
     fun parsesXmltvTimestampAndNormalizedChannelName() {
         val ts = XmltvParser.parseXmltvTimestamp("20261122183000 +0300")
         assertTrue(ts > 0L)

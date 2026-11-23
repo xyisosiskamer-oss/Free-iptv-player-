@@ -111,6 +111,7 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
     private val syncingPlaylistIdsFlow = MutableStateFlow<Set<Long>>(emptySet())
     private val playerSessionFlow = MutableStateFlow<PlayerSession?>(null)
     private val pendingExternalImportFlow = MutableStateFlow<PendingExternalImport?>(null)
+    private val lastPlayerAutoRefreshByPlaylist = mutableMapOf<Long, Long>()
 
     private val _snackbarEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val snackbarEvents = _snackbarEvents.asSharedFlow()
@@ -197,22 +198,59 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
         }
 
         val favUrls = chData.favorites.map { it.streamUrl }.toHashSet()
+        val favPlaylistNames = chData.favorites.map { "${it.playlistId}|${it.name.trim().lowercase()}" }.toHashSet()
         val channelByUrl = chData.allChannels.associateBy { it.streamUrl }
+        val channelByPlaylistGroupName = chData.allChannels.associateBy {
+            "${it.playlistId}|${it.groupTitle.trim().lowercase()}|${it.name.trim().lowercase()}"
+        }
+        val channelByPlaylistName = chData.allChannels.associateBy {
+            "${it.playlistId}|${it.name.trim().lowercase()}"
+        }
+        val channelByPlaylistTvgId = chData.allChannels
+            .filter { !it.tvgId.isNullOrBlank() }
+            .associateBy { "${it.playlistId}|${it.tvgId!!.trim().lowercase()}" }
+
+        fun findUpdatedChannel(ch: ChannelItem): ChannelItem? {
+            channelByUrl[ch.streamUrl]?.let { return it }
+            val normName = ch.name.trim().lowercase()
+            val normGroup = ch.groupTitle.trim().lowercase()
+            channelByPlaylistGroupName["${ch.playlistId}|$normGroup|$normName"]?.let { return it }
+            channelByPlaylistName["${ch.playlistId}|$normName"]?.let { return it }
+            val normTvg = ch.tvgId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            if (normTvg != null) {
+                channelByPlaylistTvgId["${ch.playlistId}|$normTvg"]?.let { return it }
+            }
+            return null
+        }
+
+        fun isChannelFavorite(ch: ChannelItem): Boolean {
+            return favUrls.contains(ch.streamUrl) ||
+                favPlaylistNames.contains("${ch.playlistId}|${ch.name.trim().lowercase()}")
+        }
+
         val recentItems = chData.recents.mapIndexed { idx, rec ->
+            val normName = rec.name.trim().lowercase()
+            val normGroup = rec.groupTitle.trim().lowercase()
             val matched = channelByUrl[rec.streamUrl]
+                ?: channelByPlaylistGroupName["${rec.playlistId}|$normGroup|$normName"]
+                ?: channelByPlaylistName["${rec.playlistId}|$normName"]
+            val resolvedUrl = matched?.streamUrl ?: rec.streamUrl
+            val isFav = favUrls.contains(resolvedUrl) ||
+                favUrls.contains(rec.streamUrl) ||
+                favPlaylistNames.contains("${rec.playlistId}|$normName")
             ChannelItem(
                 id = -1000L - idx,
                 playlistId = rec.playlistId,
                 playlistName = base.playlists.firstOrNull { it.id == rec.playlistId }?.name ?: "",
-                name = rec.name,
-                streamUrl = rec.streamUrl,
-                logoUrl = rec.logoUrl,
-                groupTitle = rec.groupTitle,
+                name = matched?.name ?: rec.name,
+                streamUrl = resolvedUrl,
+                logoUrl = matched?.logoUrl ?: rec.logoUrl,
+                groupTitle = matched?.groupTitle ?: rec.groupTitle,
                 tvgId = matched?.tvgId,
-                userAgent = rec.userAgent,
-                referrer = rec.referrer,
+                userAgent = matched?.userAgent ?: rec.userAgent,
+                referrer = matched?.referrer ?: rec.referrer,
                 position = idx,
-                isFavorite = favUrls.contains(rec.streamUrl),
+                isFavorite = isFav,
                 catchupType = matched?.catchupType,
                 catchupDays = matched?.catchupDays ?: 0,
                 catchupSource = matched?.catchupSource,
@@ -224,15 +262,27 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
         }
 
         val syncedSession = controls.playerSession?.let { session ->
-            val liveCurrent = channelByUrl[session.currentChannel.streamUrl]
-            val updatedCurrent = (liveCurrent ?: session.currentChannel).copy(
-                isFavorite = favUrls.contains(session.currentChannel.streamUrl)
-            )
-            val updatedQueue = session.queue.map { q ->
-                val liveQ = channelByUrl[q.streamUrl]
-                (liveQ ?: q).copy(isFavorite = favUrls.contains(q.streamUrl))
+            val liveCurrent = findUpdatedChannel(session.currentChannel)
+            val baseCurrent = liveCurrent ?: session.currentChannel
+            val updatedCurrent = baseCurrent.copy(isFavorite = isChannelFavorite(baseCurrent))
+            val updatedArchive = session.archivePlayback?.let { archive ->
+                if (liveCurrent != null && liveCurrent.streamUrl != session.currentChannel.streamUrl) {
+                    archive.copy(
+                        archiveUrl = CatchupUrlBuilder.buildArchiveUrl(updatedCurrent, archive.program)
+                    )
+                } else {
+                    archive
+                }
             }
-            session.copy(currentChannel = updatedCurrent, queue = updatedQueue)
+            val updatedQueue = session.queue.map { q ->
+                val baseQ = findUpdatedChannel(q) ?: q
+                baseQ.copy(isFavorite = isChannelFavorite(baseQ))
+            }
+            session.copy(
+                currentChannel = updatedCurrent,
+                queue = updatedQueue,
+                archivePlayback = updatedArchive
+            )
         }
 
         TeleWaveUiState(
@@ -538,6 +588,31 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun refreshPlaylistForPlayer(playlistId: Long, isAutoRetry: Boolean) {
+        if (syncingPlaylistIdsFlow.value.contains(playlistId)) return
+        val playlist = uiState.value.playlists.firstOrNull { it.id == playlistId } ?: return
+        if (playlist.isLocalFile) return
+        if (isAutoRetry) {
+            val now = System.currentTimeMillis()
+            val lastAttempt = lastPlayerAutoRefreshByPlaylist[playlistId] ?: 0L
+            if (now - lastAttempt < 90_000L) return
+            lastPlayerAutoRefreshByPlaylist[playlistId] = now
+        }
+        viewModelScope.launch {
+            syncingPlaylistIdsFlow.value = syncingPlaylistIdsFlow.value + playlistId
+            val result = repository.refreshPlaylist(playlistId)
+            syncingPlaylistIdsFlow.value = syncingPlaylistIdsFlow.value - playlistId
+            if (!isAutoRetry) {
+                val strings = stringsFor(uiState.value.language)
+                result.onSuccess { count ->
+                    _snackbarEvents.tryEmit(strings.playlistRefreshedMsg(playlist.name, count))
+                }.onFailure { err ->
+                    _snackbarEvents.tryEmit(strings.playlistLoadError(err.message ?: "Error"))
+                }
+            }
+        }
+    }
+
     fun refreshActiveOrAllPlaylists() {
         viewModelScope.launch {
             isSyncingFlow.value = true
@@ -556,7 +631,12 @@ class TeleWaveViewModel(application: Application) : AndroidViewModel(application
                     repository.syncAllEpgSources()
                 }
             } else {
-                repository.refreshAllEnabledPlaylists()
+                val summary = repository.refreshAllEnabledPlaylists()
+                if (summary.refreshedPlaylists > 0) {
+                    _snackbarEvents.tryEmit(strings.playlistRefreshedMsg(strings.allPlaylists, summary.totalChannels))
+                } else if (summary.lastError != null) {
+                    _snackbarEvents.tryEmit(strings.playlistLoadError(summary.lastError))
+                }
             }
             isSyncingFlow.value = false
         }

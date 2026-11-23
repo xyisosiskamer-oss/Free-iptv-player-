@@ -24,7 +24,7 @@ object M3uParser {
 
     fun parse(rawContent: String): List<ParsedChannel> = parsePlaylist(rawContent).channels
 
-    fun parsePlaylist(rawContent: String): M3uParseResult {
+    fun parsePlaylist(rawContent: String, baseUrl: String? = null): M3uParseResult {
         val cleaned = rawContent.removePrefix("\uFEFF")
         val lines = cleaned.lineSequence()
             .map { it.trim() }
@@ -85,6 +85,10 @@ object M3uParser {
                     pendingGroup = attrs["group-title"]?.trim().orEmpty()
                     val tvgName = attrs["tvg-name"]?.takeIf { it.isNotBlank() }
                     pendingName = titlePart.ifBlank { tvgName } ?: "TV Channel"
+                    pendingUserAgent = (attrs["user-agent"] ?: attrs["http-user-agent"])?.takeIf { it.isNotBlank() }
+                        ?: pendingUserAgent
+                    pendingReferrer = (attrs["referer"] ?: attrs["referrer"] ?: attrs["http-referrer"])
+                        ?.takeIf { it.isNotBlank() } ?: pendingReferrer
 
                     pendingCatchupType = (attrs["catchup"] ?: attrs["catchup-type"])
                         ?.takeIf { it.isNotBlank() } ?: defaultCatchupType
@@ -117,8 +121,9 @@ object M3uParser {
 
                 line.startsWith("#") -> Unit
 
-                looksLikeStreamUrl(line) -> {
-                    val (cleanUrl, inlineUa, inlineRef) = splitInlineHeaders(line)
+                looksLikeStreamUrl(line) || (hasMetadataForNextUrl && isResolvableRelativeUrl(line, baseUrl)) -> {
+                    val resolvedLine = resolveUrlIfRelative(line, baseUrl)
+                    val (cleanUrl, inlineUa, inlineRef) = splitInlineHeaders(resolvedLine)
                     val finalName = pendingName?.takeIf { it.isNotBlank() }
                         ?: deriveNameFromUrl(cleanUrl, channels.size + 1)
                     channels.add(
@@ -191,6 +196,20 @@ object M3uParser {
             lower.startsWith("rtp://") ||
             lower.startsWith("udp://") ||
             lower.startsWith("mms://")
+    }
+
+    private fun isResolvableRelativeUrl(line: String, baseUrl: String?): Boolean {
+        if (baseUrl.isNullOrBlank()) return false
+        if (line.startsWith("#") || line.contains(' ')) return false
+        return line.startsWith("/") || line.endsWith(".m3u8", ignoreCase = true) ||
+            line.endsWith(".ts", ignoreCase = true) || line.contains(".m3u8?")
+    }
+
+    private fun resolveUrlIfRelative(line: String, baseUrl: String?): String {
+        if (looksLikeStreamUrl(line) || baseUrl.isNullOrBlank()) return line
+        return runCatching {
+            java.net.URI(baseUrl).resolve(line).toString()
+        }.getOrDefault(line)
     }
 
     private fun splitInlineHeaders(rawUrl: String): Triple<String, String?, String?> {

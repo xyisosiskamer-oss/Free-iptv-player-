@@ -60,6 +60,9 @@ interface TeleWaveDao {
     @Query("SELECT EXISTS(SELECT 1 FROM favorites WHERE streamUrl = :streamUrl)")
     suspend fun isFavorite(streamUrl: String): Boolean
 
+    @Query("SELECT * FROM favorites WHERE playlistId = :playlistId AND LOWER(TRIM(name)) = LOWER(TRIM(:name)) LIMIT 1")
+    suspend fun findFavoriteByPlaylistAndName(playlistId: Long, name: String): FavoriteEntity?
+
     @Query("SELECT * FROM recent_channels ORDER BY lastWatchedAt DESC LIMIT 12")
     fun observeRecentChannels(): Flow<List<RecentChannelEntity>>
 

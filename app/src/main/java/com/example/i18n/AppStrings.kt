@@ -159,7 +159,10 @@ data class AppStrings(
     val sleepTimerOff: String,
     val sleepTimerMinutes: (Int) -> String,
     val sleepTimerRemaining: (Int) -> String,
-    val sleepTimerTriggeredMsg: String
+    val sleepTimerTriggeredMsg: String,
+    val refreshPlaylistAndRetry: String,
+    val refreshingStreamTokens: String,
+    val streamExpiredHint: String
 )
 
 val RussianStrings = AppStrings(
@@ -310,7 +313,10 @@ val RussianStrings = AppStrings(
     sleepTimerOff = "Выкл",
     sleepTimerMinutes = { min -> "$min мин" },
     sleepTimerRemaining = { min -> "Сон: ${min}м" },
-    sleepTimerTriggeredMsg = "Таймер сна сработал — воспроизведение поставлено на паузу"
+    sleepTimerTriggeredMsg = "Таймер сна сработал — воспроизведение поставлено на паузу",
+    refreshPlaylistAndRetry = "Обновить плейлист",
+    refreshingStreamTokens = "Обновление ссылок плейлиста...",
+    streamExpiredHint = "Временные ссылки плейлиста могли устареть — попробуйте обновить плейлист."
 )
 
 val GeorgianStrings = AppStrings(
@@ -461,7 +467,10 @@ val GeorgianStrings = AppStrings(
     sleepTimerOff = "გამორთული",
     sleepTimerMinutes = { min -> "$min წთ" },
     sleepTimerRemaining = { min -> "ძილი: ${min}წთ" },
-    sleepTimerTriggeredMsg = "ძილის ტაიმერი ამოიწურა — დაკვრა დაპაუზდა"
+    sleepTimerTriggeredMsg = "ძილის ტაიმერი ამოიწურა — დაკვრა დაპაუზდა",
+    refreshPlaylistAndRetry = "ფლეილისტის განახლება",
+    refreshingStreamTokens = "ფლეილისტის ბმულების განახლება...",
+    streamExpiredHint = "დროებითი ბმულები შესაძლოა მოძველდა — სცადეთ ფლეილისტის განახლება."
 )
 
 fun stringsFor(language: AppLanguage): AppStrings = when (language) {

@@ -22,10 +22,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -42,8 +45,10 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
@@ -111,6 +116,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -181,6 +187,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 }
 
 @OptIn(UnstableApi::class)
+@kotlin.OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun PlayerScreen(
     session: PlayerSession,
@@ -188,6 +195,9 @@ fun PlayerScreen(
     resizeMode: PlayerResizeMode,
     isTv: Boolean,
     httpClient: OkHttpClient,
+    isPlaylistRemote: Boolean = false,
+    isRefreshingPlaylist: Boolean = false,
+    onRefreshPlaylist: (isAutoRetry: Boolean) -> Unit = {},
     onBack: () -> Unit,
     onSelectChannel: (ChannelItem) -> Unit,
     onNextChannel: () -> Unit,
@@ -211,7 +221,15 @@ fun PlayerScreen(
     var isBuffering by remember { mutableStateOf(true) }
     var isPlaying by remember { mutableStateOf(true) }
     var playbackError by remember { mutableStateOf<PlayerErrorState?>(null) }
+    val activeArchive = session.archivePlayback
+    val playbackUrl = activeArchive?.archiveUrl ?: session.currentChannel.streamUrl
+
     var retryCounter by remember { mutableIntStateOf(0) }
+    var autoRefreshAttempted by remember(playbackUrl) {
+        mutableStateOf(false)
+    }
+    var awaitingManualRefresh by remember { mutableStateOf(false) }
+    var urlBeforeManualRefresh by remember { mutableStateOf<String?>(null) }
     var quickListTab by remember { mutableIntStateOf(0) } // 0 = Queue, 1 = Favorites, 2 = EPG / Archive
     var playerSearchQuery by remember { mutableStateOf("") }
 
@@ -242,9 +260,6 @@ fun PlayerScreen(
             if (initialBrightness in 0f..1f) initialBrightness else 0.6f
         )
     }
-
-    val activeArchive = session.archivePlayback
-    val playbackUrl = activeArchive?.archiveUrl ?: session.currentChannel.streamUrl
 
     val exoPlayer = remember {
         val renderersFactory = DefaultRenderersFactory(context)
@@ -343,15 +358,20 @@ fun PlayerScreen(
                 }
             }
 
-        val loadErrorPolicy = object : DefaultLoadErrorHandlingPolicy(1) {
+        val loadErrorPolicy = object : DefaultLoadErrorHandlingPolicy(3) {
             override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
                 val err = loadErrorInfo.exception
-                if (err is HttpDataSource.InvalidResponseCodeException &&
-                    (err.responseCode == 404 || err.responseCode == 403 || err.responseCode == 410)
-                ) {
-                    return C.TIME_UNSET
+                if (err is HttpDataSource.InvalidResponseCodeException) {
+                    val code = err.responseCode
+                    if (code == 401 || code == 403 || code == 404 || code == 410) {
+                        return if (loadErrorInfo.errorCount <= 1) 900L else C.TIME_UNSET
+                    }
                 }
-                return if (loadErrorInfo.errorCount <= 1) 600L else C.TIME_UNSET
+                return if (loadErrorInfo.errorCount <= 3) {
+                    (loadErrorInfo.errorCount * 800L).coerceAtMost(3000L)
+                } else {
+                    C.TIME_UNSET
+                }
             }
         }
 
@@ -364,6 +384,30 @@ fun PlayerScreen(
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         showControls = true
+    }
+
+    LaunchedEffect(playbackError, playbackUrl, isPlaylistRemote, isRefreshingPlaylist) {
+        val err = playbackError
+        if (err is PlayerErrorState.HttpCode &&
+            err.code in listOf(401, 403, 404, 410) &&
+            isPlaylistRemote &&
+            !autoRefreshAttempted &&
+            !isRefreshingPlaylist
+        ) {
+            autoRefreshAttempted = true
+            onRefreshPlaylist(true)
+        }
+    }
+
+    LaunchedEffect(isRefreshingPlaylist) {
+        if (!isRefreshingPlaylist && awaitingManualRefresh) {
+            val unchanged = urlBeforeManualRefresh == playbackUrl
+            awaitingManualRefresh = false
+            urlBeforeManualRefresh = null
+            if (unchanged) {
+                retryCounter++
+            }
+        }
     }
 
     LaunchedEffect(playbackSpeed) {
@@ -675,49 +719,199 @@ fun PlayerScreen(
                 }
 
                 playbackError?.let { errState ->
-                    Box(
+                    val isAuthOrNotFound = errState is PlayerErrorState.HttpCode &&
+                        errState.code in listOf(401, 403, 404, 410)
+                    val isCompactHeight = !useSideBySideOrFullscreen
+                    Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color(0xD9070B14))
-                            .padding(20.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.ErrorOutline,
-                                contentDescription = null,
-                                tint = CoralAccent,
-                                modifier = Modifier.size(40.dp)
-                            )
-                            Text(
-                                text = strings.streamErrorTitle,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
-                            Text(
-                                text = when (errState) {
-                                    is PlayerErrorState.HttpCode -> strings.streamHttpErrorSubtitle(errState.code)
-                                    is PlayerErrorState.Timeout -> strings.streamTimeoutErrorSubtitle
-                                    is PlayerErrorState.Generic -> strings.streamErrorSubtitle
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.78f)
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                OutlinedButton(
-                                    onClick = { retryCounter++ },
-                                    modifier = Modifier.testTag("player_retry_button")
-                                ) {
-                                    Icon(Icons.Filled.Refresh, contentDescription = null)
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(strings.tryAgain)
+                            .background(Color(0xE8070B14))
+                            .then(
+                                if (useSideBySideOrFullscreen) {
+                                    Modifier
+                                        .statusBarsPadding()
+                                        .navigationBarsPadding()
+                                        .displayCutoutPadding()
+                                } else {
+                                    Modifier
                                 }
-                                if (session.queue.size > 1) {
-                                    Button(onClick = onNextChannel) {
-                                        Text(strings.nextWorkingChannel)
+                            )
+                            .padding(horizontal = 12.dp, vertical = if (isCompactHeight) 8.dp else 12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                OsdIconButton(
+                                    onClick = onBack,
+                                    testTag = "player_error_back_button"
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                        contentDescription = strings.back,
+                                        tint = Color.White
+                                    )
+                                }
+                                Text(
+                                    text = session.currentChannel.name,
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OsdIconButton(
+                                    onClick = { onToggleFavorite(session.currentChannel) },
+                                    testTag = "player_error_favorite_button"
+                                ) {
+                                    Icon(
+                                        imageVector = if (session.currentChannel.isFavorite) {
+                                            Icons.Filled.Favorite
+                                        } else {
+                                            Icons.Outlined.FavoriteBorder
+                                        },
+                                        contentDescription = if (session.currentChannel.isFavorite) {
+                                            strings.removeFromFavorites
+                                        } else {
+                                            strings.addToFavorites
+                                        },
+                                        tint = if (session.currentChannel.isFavorite) CoralAccent else Color.White
+                                    )
+                                }
+                                if (!isTv) {
+                                    OsdIconButton(
+                                        onClick = {
+                                            orientationLock = if (isLandscape) {
+                                                PlayerOrientationLock.LOCKED_PORTRAIT
+                                            } else {
+                                                PlayerOrientationLock.LOCKED_LANDSCAPE
+                                            }
+                                        },
+                                        testTag = "player_error_fullscreen_button"
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isLandscape) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                                            contentDescription = if (isLandscape) strings.fullscreenExit else strings.fullscreenEnter,
+                                            tint = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState()),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(if (isCompactHeight) 6.dp else 10.dp),
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                if (isRefreshingPlaylist) {
+                                    CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(28.dp),
+                                        strokeWidth = 2.5.dp
+                                    )
+                                    Text(
+                                        text = strings.refreshingStreamTokens,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = Color.White,
+                                        textAlign = TextAlign.Center
+                                    )
+                                } else {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.ErrorOutline,
+                                            contentDescription = null,
+                                            tint = CoralAccent,
+                                            modifier = Modifier.size(if (isCompactHeight) 22.dp else 32.dp)
+                                        )
+                                        Text(
+                                            text = strings.streamErrorTitle,
+                                            style = if (isCompactHeight) {
+                                                MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                                            } else {
+                                                MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                            },
+                                            color = Color.White,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    val baseSubtitle = when (errState) {
+                                        is PlayerErrorState.HttpCode -> strings.streamHttpErrorSubtitle(errState.code)
+                                        is PlayerErrorState.Timeout -> strings.streamTimeoutErrorSubtitle
+                                        is PlayerErrorState.Generic -> strings.streamErrorSubtitle
+                                    }
+                                    val fullSubtitle = if (isAuthOrNotFound && isPlaylistRemote) {
+                                        "$baseSubtitle ${strings.streamExpiredHint}"
+                                    } else {
+                                        baseSubtitle
+                                    }
+                                    Text(
+                                        text = fullSubtitle,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.White.copy(alpha = 0.8f),
+                                        textAlign = TextAlign.Center,
+                                        maxLines = if (isCompactHeight) 2 else 4,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = { retryCounter++ },
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                            modifier = Modifier.testTag("player_retry_button")
+                                        ) {
+                                            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text(strings.tryAgain, style = MaterialTheme.typography.labelMedium)
+                                        }
+                                        if (isPlaylistRemote) {
+                                            OutlinedButton(
+                                                onClick = {
+                                                    urlBeforeManualRefresh = playbackUrl
+                                                    awaitingManualRefresh = true
+                                                    onRefreshPlaylist(false)
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                                modifier = Modifier.testTag("player_refresh_playlist_button")
+                                            ) {
+                                                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(4.dp))
+                                                Text(strings.refreshPlaylistAndRetry, style = MaterialTheme.typography.labelMedium)
+                                            }
+                                        }
+                                        if (session.queue.size > 1) {
+                                            Button(
+                                                onClick = onNextChannel,
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                                modifier = Modifier.testTag("player_error_next_channel_button")
+                                            ) {
+                                                Text(strings.nextWorkingChannel, style = MaterialTheme.typography.labelMedium)
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -840,9 +1034,31 @@ fun PlayerScreen(
                     }
                 }
 
+                // Persistent Portrait Fullscreen button when OSD auto-hides
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = !isLandscape && !isTv && !isScreenLocked && playbackError == null && !showControls,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(10.dp)
+                ) {
+                    OsdIconButton(
+                        onClick = { orientationLock = PlayerOrientationLock.LOCKED_LANDSCAPE },
+                        containerColor = Color.Black.copy(alpha = 0.45f),
+                        testTag = "player_persistent_fullscreen_button"
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Fullscreen,
+                            contentDescription = strings.fullscreenEnter,
+                            tint = Color.White.copy(alpha = 0.9f)
+                        )
+                    }
+                }
+
                 // OSD Overlay
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = showControls && !isScreenLocked,
+                    visible = showControls && !isScreenLocked && playbackError == null,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier.fillMaxSize()
@@ -1111,10 +1327,12 @@ fun PlayerScreen(
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Row(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
@@ -1192,25 +1410,18 @@ fun PlayerScreen(
                                             tint = Color.White
                                         )
                                     }
-                                }
 
-                                if (isTv) {
-                                    Text(
-                                        text = strings.tvControlsHint,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = Color.White.copy(alpha = 0.72f),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier
-                                            .weight(1f, fill = false)
-                                            .padding(horizontal = 8.dp)
-                                    )
-                                }
+                                    if (isTv) {
+                                        Text(
+                                            text = strings.tvControlsHint,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.White.copy(alpha = 0.72f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(horizontal = 6.dp)
+                                        )
+                                    }
 
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
                                     if (isSeekable || activeArchive != null) {
                                         val speeds = listOf(0.5f, 1.0f, 1.25f, 1.5f, 2.0f)
                                         Surface(
@@ -1290,31 +1501,34 @@ fun PlayerScreen(
                                                 tint = Color.White
                                             )
                                         }
+                                    }
+                                }
 
-                                        OsdIconButton(
-                                            onClick = {
-                                                orientationLock = if (isLandscape) {
-                                                    PlayerOrientationLock.LOCKED_PORTRAIT
-                                                } else {
-                                                    PlayerOrientationLock.LOCKED_LANDSCAPE
-                                                }
+                                if (!isTv) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OsdIconButton(
+                                        onClick = {
+                                            orientationLock = if (isLandscape) {
+                                                PlayerOrientationLock.LOCKED_PORTRAIT
+                                            } else {
+                                                PlayerOrientationLock.LOCKED_LANDSCAPE
+                                            }
+                                        },
+                                        testTag = "player_fullscreen_button"
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isLandscape) {
+                                                Icons.Filled.FullscreenExit
+                                            } else {
+                                                Icons.Filled.Fullscreen
                                             },
-                                            testTag = "player_fullscreen_button"
-                                        ) {
-                                            Icon(
-                                                imageVector = if (isLandscape) {
-                                                    Icons.Filled.FullscreenExit
-                                                } else {
-                                                    Icons.Filled.Fullscreen
-                                                },
-                                                contentDescription = if (isLandscape) {
-                                                    strings.fullscreenExit
-                                                } else {
-                                                    strings.fullscreenEnter
-                                                },
-                                                tint = Color.White
-                                            )
-                                        }
+                                            contentDescription = if (isLandscape) {
+                                                strings.fullscreenExit
+                                            } else {
+                                                strings.fullscreenEnter
+                                            },
+                                            tint = Color.White
+                                        )
                                     }
                                 }
                             }

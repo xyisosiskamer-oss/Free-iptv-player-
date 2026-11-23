@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -74,6 +76,7 @@ import com.example.ui.components.ChannelLogo
 import com.example.ui.components.tvFocusHighlight
 import com.example.ui.viewmodel.TeleWaveUiState
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ChannelsScreen(
     uiState: TeleWaveUiState,
@@ -348,7 +351,10 @@ fun ChannelsScreen(
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
                                     if (uiState.searchQuery.isNotEmpty() || uiState.selectedCategory != null) {
                                         OutlinedButton(onClick = onClearFilters) {
                                             Text(strings.clearFilters)
@@ -521,7 +527,10 @@ private fun RecentHeroStrip(
                 }
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(recents, key = { it.streamUrl }) { ch ->
+                    itemsIndexed(
+                        items = recents,
+                        key = { idx, ch -> "recent_${idx}_${ch.id}_${ch.streamUrl}" }
+                    ) { _, ch ->
                         val chipShape = RoundedCornerShape(14.dp)
                         Surface(
                             modifier = Modifier

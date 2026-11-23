@@ -35,6 +35,7 @@ class IptvRepository(
     companion object {
         const val DEFAULT_PLAYLIST_URL = "https://m3u.work/ofRjF2G"
         const val DEFAULT_PLAYLIST_NAME = "Основной ТВ Плейлист"
+        private const val AUTO_REFRESH_STALE_MS = 20L * 60L * 1000L
     }
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -45,9 +46,12 @@ class IptvRepository(
         .readTimeout(35, TimeUnit.SECONDS)
         .build()
 
-    val playerHttpClient: OkHttpClient = httpClient.newBuilder()
-        .connectTimeout(7, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+    val playerHttpClient: OkHttpClient = OkHttpClient.Builder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
     val playlistsFlow: Flow<List<PlaylistEntity>> = dao.observePlaylists()
@@ -75,6 +79,7 @@ class IptvRepository(
     ) { channels, playlists, favorites, epg ->
         val playlistMap = playlists.associateBy { it.id }
         val favoriteUrls = favorites.map { it.streamUrl }.toHashSet()
+        val favoritePlaylistNames = favorites.map { "${it.playlistId}|${it.name.trim().lowercase()}" }.toHashSet()
         val now = System.currentTimeMillis()
         channels.mapNotNull { ch ->
             val playlist = playlistMap[ch.playlistId]
@@ -82,6 +87,8 @@ class IptvRepository(
                 null
             } else {
                 val resolved = resolveEpgForChannel(ch.tvgId, ch.name, ch.catchupDays, epg, now)
+                val isFav = favoriteUrls.contains(ch.streamUrl) ||
+                    favoritePlaylistNames.contains("${ch.playlistId}|${ch.name.trim().lowercase()}")
                 ChannelItem(
                     id = ch.id,
                     playlistId = ch.playlistId,
@@ -94,7 +101,7 @@ class IptvRepository(
                     userAgent = ch.userAgent,
                     referrer = ch.referrer,
                     position = ch.position,
-                    isFavorite = favoriteUrls.contains(ch.streamUrl),
+                    isFavorite = isFav,
                     catchupType = ch.catchupType,
                     catchupDays = ch.catchupDays,
                     catchupSource = ch.catchupSource,
@@ -115,9 +122,11 @@ class IptvRepository(
     ) { favorites, playlists, allChannels, epg ->
         val playlistMap = playlists.associateBy { it.id }
         val channelByUrl = allChannels.associateBy { it.streamUrl }
+        val channelByPlaylistAndName = allChannels.associateBy { "${it.playlistId}|${it.name.trim().lowercase()}" }
         val now = System.currentTimeMillis()
         favorites.mapIndexed { index, fav ->
             val matched = channelByUrl[fav.streamUrl]
+                ?: channelByPlaylistAndName["${fav.playlistId}|${fav.name.trim().lowercase()}"]
             val tvgId = matched?.tvgId
             val catchupDays = matched?.catchupDays ?: 0
             val resolved = resolveEpgForChannel(tvgId, fav.name, catchupDays, epg, now)
@@ -126,12 +135,12 @@ class IptvRepository(
                 playlistId = fav.playlistId,
                 playlistName = playlistMap[fav.playlistId]?.name ?: "",
                 name = fav.name,
-                streamUrl = fav.streamUrl,
-                logoUrl = fav.logoUrl,
-                groupTitle = fav.groupTitle,
+                streamUrl = matched?.streamUrl ?: fav.streamUrl,
+                logoUrl = matched?.logoUrl ?: fav.logoUrl,
+                groupTitle = matched?.groupTitle ?: fav.groupTitle,
                 tvgId = tvgId,
-                userAgent = fav.userAgent,
-                referrer = fav.referrer,
+                userAgent = matched?.userAgent ?: fav.userAgent,
+                referrer = matched?.referrer ?: fav.referrer,
                 position = index,
                 isFavorite = true,
                 catchupType = matched?.catchupType,
@@ -160,9 +169,12 @@ class IptvRepository(
             prefs.markDefaultSeeded()
             refreshPlaylist(id)
         } else {
+            val now = System.currentTimeMillis()
             val playlists = dao.getPlaylistsOnce()
-            playlists.filter { it.isEnabled && !it.isLocalFile && it.lastUpdatedAt == 0L }
-                .forEach { refreshPlaylist(it.id) }
+            playlists.filter {
+                it.isEnabled && !it.isLocalFile &&
+                    (it.lastUpdatedAt == 0L || (now - it.lastUpdatedAt) >= AUTO_REFRESH_STALE_MS)
+            }.forEach { refreshPlaylist(it.id) }
         }
         syncAllEpgSources()
         return dao.getPlaylistsOnce()
@@ -356,7 +368,9 @@ class IptvRepository(
 
         return try {
             val raw = fetchM3uText(playlist.url)
-            val parseResult = withContext(Dispatchers.Default) { M3uParser.parsePlaylist(raw) }
+            val parseResult = withContext(Dispatchers.Default) {
+                M3uParser.parsePlaylist(raw, baseUrl = playlist.url)
+            }
             if (parseResult.channels.isEmpty()) {
                 val err = "0 channels parsed"
                 dao.updatePlaylist(playlist.copy(lastError = err))
@@ -381,14 +395,33 @@ class IptvRepository(
         }
     }
 
-    suspend fun refreshAllEnabledPlaylists(): Int {
+    data class RefreshAllSummary(
+        val refreshedPlaylists: Int,
+        val totalChannels: Int,
+        val lastError: String?
+    )
+
+    suspend fun refreshAllEnabledPlaylists(): RefreshAllSummary {
         val playlists = dao.getPlaylistsOnce().filter { it.isEnabled && !it.isLocalFile }
         var total = 0
+        var succeeded = 0
+        var lastErr: String? = null
         for (playlist in playlists) {
-            refreshPlaylist(playlist.id).onSuccess { total += it }
+            refreshPlaylist(playlist.id)
+                .onSuccess {
+                    total += it
+                    succeeded++
+                }
+                .onFailure {
+                    lastErr = it.message ?: "Network error"
+                }
         }
         syncAllEpgSources()
-        return total
+        return RefreshAllSummary(
+            refreshedPlaylists = succeeded,
+            totalChannels = total,
+            lastError = lastErr
+        )
     }
 
     suspend fun syncAllEpgSources(): Result<Int> {
@@ -468,24 +501,28 @@ class IptvRepository(
 
     suspend fun toggleFavorite(channel: ChannelItem): Boolean {
         val currentlyFav = dao.isFavorite(channel.streamUrl)
-        return if (currentlyFav) {
+        if (currentlyFav) {
             dao.deleteFavoriteByUrl(channel.streamUrl)
-            false
-        } else {
-            dao.insertFavorite(
-                FavoriteEntity(
-                    streamUrl = channel.streamUrl,
-                    name = channel.name,
-                    logoUrl = channel.logoUrl,
-                    groupTitle = channel.groupTitle,
-                    playlistId = channel.playlistId,
-                    userAgent = channel.userAgent,
-                    referrer = channel.referrer,
-                    addedAt = System.currentTimeMillis()
-                )
-            )
-            true
+            return false
         }
+        val fallbackMatch = dao.findFavoriteByPlaylistAndName(channel.playlistId, channel.name)
+        if (fallbackMatch != null) {
+            dao.deleteFavoriteByUrl(fallbackMatch.streamUrl)
+            return false
+        }
+        dao.insertFavorite(
+            FavoriteEntity(
+                streamUrl = channel.streamUrl,
+                name = channel.name,
+                logoUrl = channel.logoUrl,
+                groupTitle = channel.groupTitle,
+                playlistId = channel.playlistId,
+                userAgent = channel.userAgent,
+                referrer = channel.referrer,
+                addedAt = System.currentTimeMillis()
+            )
+        )
+        return true
     }
 
     suspend fun recordRecent(channel: ChannelItem) {
